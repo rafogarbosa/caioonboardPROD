@@ -1,0 +1,40 @@
+#!/bin/bash
+set -euo pipefail
+
+APP_DIR="/xcoutfy"
+REPO_URL="${1:-https://github.com/rafogarbosa/caioonboardPROD.git}"
+
+echo "📦 Installing/Updating app from $REPO_URL"
+
+if [ -d "$APP_DIR/.git" ]; then
+  cd "$APP_DIR"
+  git fetch --all
+  git reset --hard origin/main
+else
+  rm -rf "$APP_DIR"
+  git clone "$REPO_URL" "$APP_DIR"
+  cd "$APP_DIR"
+fi
+
+# cria venv
+python3 -m venv /xcoutfy/venv
+source /xcoutfy/venv/bin/activate
+
+# instala requirements, se houver
+if [ -f requirements.txt ]; then
+  pip install --upgrade pip
+  pip install -r requirements.txt
+fi
+
+# gera .env automaticamente
+if [ ! -f /xcoutfy/.env ]; then
+  echo "⚙️ Creating environment file (.env)..."
+  cp /xcoutfy/install/env.example /xcoutfy/.env
+  HOSTNAME=$(hostname)
+  sed -i "s/^DEVICE_NAME=.*/DEVICE_NAME=${HOSTNAME}/" /xcoutfy/.env
+  echo "✅ DEVICE_NAME definido automaticamente como ${HOSTNAME}"
+else
+  echo "ℹ️ .env já existe, mantendo configuração atual."
+fi
+
+echo "✅ App installed."

@@ -1,0 +1,16 @@
+[Unit]
+Description=Xcoutfy Upload Service - 02upload.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orangepi
+WorkingDirectory=/xcoutfy
+ExecStart=/xcoutfy/venv/bin/python3 /xcoutfy/02upload.py
+Restart=always
+RestartSec=10
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=/xcoutfy/.env
+
+[Install]
+WantedBy=multi-user.target
