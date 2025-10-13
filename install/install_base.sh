@@ -1,22 +1,20 @@
 #!/bin/bash
 set -euo pipefail
-echo "🔧 Applying Xcoutfy base setup..."
+echo "🔧 Applying Xcoutfy base setup (minimal, no locales)..."
 
-# Atualização leve
-sudo apt update -y && sudo apt upgrade -y
+# evita qualquer prompt interativo e pacote de idioma
+export DEBIAN_FRONTEND=noninteractive
+export LC_ALL=C
+export LANGUAGE=C
+export LANG=C
 
-# Instala apenas o essencial (sem pacotes de idioma)
-sudo apt install -y --no-install-recommends python3-venv python3-pip ffmpeg v4l-utils rclone curl git net-tools language-pack-en
-sudo update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
-export LANG=en_US.UTF-8
+# atualização leve e silenciosa
+sudo apt-get -o Dpkg::Options::="--force-confnew" update -y
+sudo apt-get -o Dpkg::Options::="--force-confnew" upgrade -y
 
-# Desativa IPv6
-sudo bash -c 'cat > /etc/sysctl.d/99-disable-ipv6.conf <<EOT
-net.ipv6.conf.all.disable_ipv6 = 1
-net.ipv6.conf.default.disable_ipv6 = 1
-net.ipv6.conf.lo.disable_ipv6 = 1
-EOT'
-sudo sysctl -p /etc/sysctl.d/99-disable-ipv6.conf
+# instala só o essencial — nada de idioma
+sudo apt-get install -y --no-install-recommends \
+  python3-venv python3-pip ffmpeg v4l-utils rclone curl git net-tools
 
 # DNS fixo global
 sudo bash -c 'cat > /etc/resolv.conf <<EOT
@@ -25,9 +23,9 @@ nameserver 1.1.1.1
 EOT'
 sudo chattr +i /etc/resolv.conf || true
 
-# Estrutura de pastas padrão
+# estrutura de pastas
 sudo mkdir -p /xcoutfy/{logs,schedules,recorded_videos,uploaded_videos,broadcastdone,keys}
 sudo chown -R orangepi:orangepi /xcoutfy
 sudo chmod -R 775 /xcoutfy
 
-echo "✅ Base setup applied (locales skipped)."
+echo "✅ Base setup applied (no locales, fast build)."
