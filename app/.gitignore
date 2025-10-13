@@ -1,0 +1,13 @@
+# não subir vídeos, logs, venv e caches
+recorded_videos/
+uploaded_videos/
+broadcastdone/
+continuous_videos/
+storage_videos/
+logs/
+venv/
+__pycache__/
+*.log
+*.mp4
+*.uploaded
+*.broadcasted
