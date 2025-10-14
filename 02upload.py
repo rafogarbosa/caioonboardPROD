@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# === 02upload.py (versão corrigida para parsing de metadados) ===
+# === 02upload.py (versão final com integridade MP4 e backoff Sheets) ===
 import os
 import subprocess
 import time
@@ -9,6 +9,36 @@ from google.oauth2.service_account import Credentials
 import shutil
 import sys
 from a07broadcast import get_agenda, get_current_window
+
+
+# === PATCH START: funções de verificação de integridade do MP4 ===
+def is_mp4_ready(path, min_quiet=30):
+    """Verifica se o arquivo MP4 está pronto (sem escrita há 30s e ffprobe consegue ler duração)."""
+    try:
+        quiet = time.time() - os.path.getmtime(path)
+        if quiet < min_quiet:
+            return False
+        cmd = [
+            "ffprobe", "-v", "error",
+            "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", path
+        ]
+        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
+        return bool(out) and float(out) > 0.0
+    except Exception:
+        return False
+
+
+def wait_until_ready(path, timeout=180, poll=5):
+    """Espera até o MP4 ficar pronto, ou estoura timeout (segundos)."""
+    start = time.time()
+    while time.time() - start < timeout:
+        if is_mp4_ready(path):
+            return True
+        time.sleep(poll)
+    return False
+# === PATCH END ===
+
 
 # =========================
 # Logging
@@ -27,8 +57,10 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
+
 sys.stdout = Logger("/xcoutfy/logs/02upload.log")
 sys.stderr = sys.stdout
+
 
 # =========================
 # Config
@@ -41,6 +73,7 @@ UPLOADED_DIR = "/xcoutfy/uploaded_videos"
 RCLONE_REMOTE = "xcoutfyvideos:xcvideos"
 UPLOAD_DELAY_SEC = 30
 CHECK_INTERVAL = 30
+
 
 # =========================
 # Helpers
@@ -55,21 +88,32 @@ def connect_to_sheets():
     return client
 
 
+# === PATCH START: função segura para abrir aba com backoff ===
+def safe_open_sheet(client, sheet_name, tab, retries=5):
+    """Abre planilha e aba com retry/backoff em caso de erro 429."""
+    for i in range(retries):
+        try:
+            sh = client.open(sheet_name).worksheet(tab)
+            return sh
+        except gspread.exceptions.APIError as e:
+            if "Quota exceeded" in str(e) and i < retries - 1:
+                wait = 2 * (i + 1)
+                print(f"⏳ Cota Sheets excedida, nova tentativa em {wait}s...")
+                time.sleep(wait)
+                continue
+            raise
+# === PATCH END ===
+
+
 def extract_metadata_from_filename(filename: str):
-    """
-    Extrai informações do nome do arquivo no formato:
-    YYYY_MM_DD___HH_MM___customer_equipment_day_duration.mp4
-    Exemplo: 2025_10_08___10_13___customer_xcpc16_Quarta_5.0min.mp4
-    """
+    """Extrai customer, equipment, day e duration do nome do arquivo."""
     try:
         name = os.path.basename(filename).replace(".mp4", "")
-
-        # Divide em blocos separados por '___'
         parts = name.split("___")
         if len(parts) < 3:
             return "unknown_customer", "unknown_eqp", "unknown_day", "unknown_duration"
 
-        meta_part = parts[2]  # terceira parte contém os metadados
+        meta_part = parts[2]
         meta_parts = meta_part.split("_")
 
         customer = meta_parts[0] if len(meta_parts) > 0 else "unknown_customer"
@@ -85,6 +129,7 @@ def extract_metadata_from_filename(filename: str):
 
 
 def append_row_safe(sheet, values):
+    """Tenta registrar linha na planilha com até 3 tentativas."""
     for attempt in range(1, 4):
         try:
             sheet.append_row(values)
@@ -102,13 +147,10 @@ def upload_video(filepath, filename, register_sheet):
         print(f"⚠️ Arquivo {filename} não encontrado. Pulando.")
         return
 
-    # Extrai metadados do nome do arquivo
+    # Extrai metadados
     customer, equipment, day, duration = extract_metadata_from_filename(filename)
-    local = equipment  # por enquanto o local é igual ao equipamento
-
-    # Cria timestamp completo
-    now = datetime.now()
-    timestamp = now.strftime("%Y-%m-%d %H:%M:%S")
+    local = equipment
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     destination_remote = f"{RCLONE_REMOTE}/{filename}"
     print(f"🚀 Enviando {filename} ao Google Drive...")
@@ -118,7 +160,7 @@ def upload_video(filepath, filename, register_sheet):
         print(f"❌ Falha no upload de {filename}")
         return
 
-    # Verifica se o arquivo aparece no Drive
+    # Confirma presença no Drive
     for _ in range(10):
         check = subprocess.run(
             ["rclone", "lsf", RCLONE_REMOTE],
@@ -153,11 +195,18 @@ def upload_video(filepath, filename, register_sheet):
         day,
         filename,
         public_link,
-        "",  # youtube_link
-        "uploaded",  # status
-        "",  # notes
+        "",
+        "uploaded",
+        "",
     ]
     append_row_safe(register_sheet, values)
+
+    # === PATCH START: garantir integridade antes de mover ===
+    print(f"⏳ Verificando integridade do vídeo antes de mover...")
+    if not wait_until_ready(filepath, timeout=180, poll=5):
+        print(f"⚠️ Arquivo {filename} não passou na verificação de integridade. Pulando move.")
+        return
+    # === PATCH END ===
 
     # Move o arquivo local para uploaded_videos
     os.makedirs(UPLOADED_DIR, exist_ok=True)
@@ -179,7 +228,7 @@ def main():
     # Conecta ao Sheets
     try:
         sheets = connect_to_sheets()
-        register_sheet = sheets.open(SHEET_NAME).worksheet(SHEET_REGISTERS)
+        register_sheet = safe_open_sheet(sheets, SHEET_NAME, SHEET_REGISTERS)
         print(f"✅ Conectado à planilha '{SHEET_NAME}', aba '{SHEET_REGISTERS}'.")
     except Exception as e:
         print(f"❌ Falha ao conectar à planilha: {e}")

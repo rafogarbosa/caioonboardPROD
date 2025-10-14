@@ -1,4 +1,5 @@
-# === a07broadcast.py ===
+#!/usr/bin/env python3
+# === a07broadcast.py (com retry/backoff no get_agenda) ===
 import os
 import time
 import subprocess
@@ -21,13 +22,35 @@ WAIT_AFTER_STREAM_SEC = 120  # Tempo (em segundos) para esperar entre transmiss�
 # === LOGGING ===
 logging.basicConfig(filename=LOG_FILE, level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
+# === PATCH START: função de retry/backoff para chamadas ao Sheets ===
+def safe_get_all_records(client, sheet_name, tab_name, retries=5):
+    """Lê registros da planilha com retry/backoff quando há erro 429 (quota exceeded)."""
+    for i in range(retries):
+        try:
+            sh = client.open(sheet_name).worksheet(tab_name)
+            return sh.get_all_records()
+        except gspread.exceptions.APIError as e:
+            if "Quota exceeded" in str(e) and i < retries - 1:
+                wait = 2 * (i + 1)
+                print(f"⏳ Cota Sheets excedida (429), aguardando {wait}s antes da nova tentativa...")
+                logging.warning(f"Cota Sheets excedida (429), retry em {wait}s (tentativa {i+1}/{retries})")
+                time.sleep(wait)
+                continue
+            raise
+# === PATCH END ===
+
 def get_agenda():
     scope = ['https://www.googleapis.com/auth/spreadsheets', 'https://www.googleapis.com/auth/drive']
     creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scope)
     client = gspread.authorize(creds)
-    agenda = client.open(SHEET_NAME).worksheet(AGENDA_TAB).get_all_records()
+
+    # === PATCH START: substitui chamada direta por função com backoff ===
+    agenda = safe_get_all_records(client, SHEET_NAME, AGENDA_TAB)
     registros = client.open(SHEET_NAME).worksheet(SHEET_REGISTROS)
+    # === PATCH END ===
+
     return agenda, registros
+
 
 def get_current_window(agenda):
     now = datetime.now()
@@ -49,9 +72,11 @@ def get_current_window(agenda):
             continue
     return None, None
 
+
 def get_oldest_uploaded():
     files = sorted([f for f in os.listdir(UPLOADED_DIR) if f.endswith(".uploaded")])
     return files[0] if files else None
+
 
 def stream_video(video_path, rtmp_key):
     ffmpeg_cmd = [
@@ -63,12 +88,14 @@ def stream_video(video_path, rtmp_key):
     ]
     return subprocess.run(ffmpeg_cmd).returncode == 0
 
+
 def move_to_done(video_file):
     if not os.path.exists(DONE_DIR):
         os.makedirs(DONE_DIR)
     src = os.path.join(UPLOADED_DIR, video_file)
     dst = os.path.join(DONE_DIR, video_file.replace(".uploaded", ".broadcasted"))
     shutil.move(src, dst)
+
 
 def register_link(registros_sheet, video_file, yt_link):
     registros = registros_sheet.get_all_records()
@@ -79,6 +106,7 @@ def register_link(registros_sheet, video_file, yt_link):
                 col_index = headers.index("youtube_link") + 1
                 registros_sheet.update_cell(idx, col_index, yt_link)
             break
+
 
 def main():
     agenda, registros_sheet = get_agenda()
@@ -127,11 +155,11 @@ def main():
             logging.info(f"⏱ Aguardando {WAIT_AFTER_STREAM_SEC} segundos antes da próxima transmissão.")
             print(f"⏱ Aguardando {WAIT_AFTER_STREAM_SEC} segundos antes da próxima transmissão...")
             time.sleep(WAIT_AFTER_STREAM_SEC)
-
         else:
             logging.error(f"Erro ao transmitir o vídeo: {oldest}")
             print(f"❌ Falha na transmissão do vídeo: {oldest}")
             break
+
 
 if __name__ == "__main__":
     try:
