@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily restart of xcoutfy-agenda.service
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=xcoutfy-agenda.service
+
+[Install]
+WantedBy=timers.target

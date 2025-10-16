@@ -1,0 +1,17 @@
+[Unit]
+Description=Xcoutfy Agenda Service - 00agenda.py
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=orangepi
+WorkingDirectory=/xcoutfy
+ExecStart=/xcoutfy/venv/bin/python3 /xcoutfy/00agenda.py
+Restart=always
+RestartSec=5
+Environment="PYTHONUNBUFFERED=1"
+EnvironmentFile=/xcoutfy/.env
+
+[Install]
+WantedBy=multi-user.target
+

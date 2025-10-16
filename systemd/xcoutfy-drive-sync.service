@@ -1,0 +1,8 @@
+[Unit]
+Description=Xcoutfy Drive/Register Sync
+
+[Service]
+Type=oneshot
+ExecStart=/xcoutfy/venv/bin/python3 /xcoutfy/drive_reg_sync.py
+WorkingDirectory=/xcoutfy
+User=orangepi

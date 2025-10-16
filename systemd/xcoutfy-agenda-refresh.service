@@ -1,0 +1,14 @@
+[Unit]
+Description=Refresh Xcoutfy agenda_backup.json from Google Sheets
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=orangepi
+WorkingDirectory=/xcoutfy
+Environment=PYTHONUNBUFFERED=1
+# Se usar credenciais fora do default, descomente e ajuste:
+# Environment=GOOGLE_APPLICATION_CREDENTIALS=/xcoutfy/credentials.json
+ExecStart=/xcoutfy/venv/bin/python3 /xcoutfy/tools/refresh_agenda.py
+Nice=10
