@@ -7,11 +7,10 @@ Wants=network-online.target
 User=orangepi
 WorkingDirectory=/xcoutfy
 ExecStart=/xcoutfy/venv/bin/python3 /xcoutfy/00agenda.py
-Restart=always
+Restart=on-failure
 RestartSec=5
 Environment="PYTHONUNBUFFERED=1"
 EnvironmentFile=/xcoutfy/.env
 
 [Install]
 WantedBy=multi-user.target
-
