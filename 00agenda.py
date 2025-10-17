@@ -160,7 +160,7 @@ def kill_idle_process(pidfile):
 def run_and_block_until_done(script_path, pidfile, env=None, args=None):
     kill_idle_process(pidfile)
     print(f"🚦 Preparando para iniciar novo processo: {script_path}")
-    cmd = ["python3", script_path]
+    cmd = [sys.executable, script_path]
     if args:
         cmd += args
     print(f"▶️ Executando comando: {' '.join(cmd)}")
@@ -169,7 +169,7 @@ def run_and_block_until_done(script_path, pidfile, env=None, args=None):
 
 def launch_process_and_store_pid(script_path, pidfile, env=None, args=None):
     kill_idle_process(pidfile)
-    cmd = ["python3", script_path]
+    cmd = [sys.executable, script_path]
     if args:
         cmd += args
     process = subprocess.Popen(cmd, env=env)
