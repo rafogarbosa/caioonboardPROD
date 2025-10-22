@@ -108,27 +108,27 @@ def iniciar_transmissao(device, stream_url):
 
     subprocess.run(ffmpeg_cmd)
 
-def registrar_link_youtube():
-    try:
-        youtube_channel_id = os.getenv("YOUTUBE_CHANNEL_ID", "")
-        if not youtube_channel_id:
-            print("⚠️ Canal do YouTube não definido.")
-            return
-
-        credentials_path = "/xcoutfy/credentials.json"
-        spreadsheet_name = "dbgravacoes"
-        worksheet_name = "registros"
-
-        credentials = Credentials.from_service_account_file(credentials_path)
-        client = gspread.authorize(credentials)
-        sheet = client.open(spreadsheet_name).worksheet(worksheet_name)
-
-        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        youtube_url = f"https://www.youtube.com/channel/{youtube_channel_id}/live"
-        sheet.append_row([now, youtube_url, "stream", os.getenv("CUSTOMER", ""), os.getenv("EQUIPMENT", "")])
-        print(f"📝 Link registrado na planilha: {youtube_url}")
-    except Exception as e:
-        print(f"⚠️ Erro ao registrar link no Google Sheets: {e}")
+#def registrar_link_youtube():
+#    try:
+#        youtube_channel_id = os.getenv("YOUTUBE_CHANNEL_ID", "")
+#        if not youtube_channel_id:
+#            print("⚠️ Canal do YouTube não definido.")
+#            return
+#
+#        credentials_path = "/xcoutfy/credentials.json"
+#        spreadsheet_name = "dbgravacoes"
+#        worksheet_name = "registros"
+#
+#        credentials = Credentials.from_service_account_file(credentials_path)
+#        client = gspread.authorize(credentials)
+#        sheet = client.open(spreadsheet_name).worksheet(worksheet_name)
+#
+#        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+#        youtube_url = f"https://www.youtube.com/channel/{youtube_channel_id}/live"
+#        sheet.append_row([now, youtube_url, "stream", os.getenv("CUSTOMER", ""), os.getenv("EQUIPMENT", "")])
+#        print(f"📝 Link registrado na planilha: {youtube_url}")
+#    except Exception as e:
+#        print(f"⚠️ Erro ao registrar link no Google Sheets: {e}")
 
 def main():
     device = detectar_camera_usb()
