@@ -1,44 +1,37 @@
 #!/usr/bin/env python3
-# === 02upload.py (versão final com integridade MP4 e backoff Sheets) ===
+# === 02upload.py (tolerância de janela + registro por cabeçalho) ===
 import os
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 import gspread
 from google.oauth2.service_account import Credentials
 import shutil
 import sys
+import psutil
+import hashlib
+from contextlib import contextmanager
 from a07broadcast import get_agenda, get_current_window
 
+# =========================
+# Constantes / Paths
+# =========================
+CREDENTIALS_PATH = "/xcoutfy/credentials.json"
+SHEET_NAME = "dbgravacoes"
+SHEET_REGISTERS = "registros"
 
-# === PATCH START: funções de verificação de integridade do MP4 ===
-def is_mp4_ready(path, min_quiet=30):
-    """Verifica se o arquivo MP4 está pronto (sem escrita há 30s e ffprobe consegue ler duração)."""
-    try:
-        quiet = time.time() - os.path.getmtime(path)
-        if quiet < min_quiet:
-            return False
-        cmd = [
-            "ffprobe", "-v", "error",
-            "-show_entries", "format=duration",
-            "-of", "default=noprint_wrappers=1:nokey=1", path
-        ]
-        out = subprocess.check_output(cmd, stderr=subprocess.STDOUT, text=True).strip()
-        return bool(out) and float(out) > 0.0
-    except Exception:
-        return False
+VIDEO_DIRS = ["/xcoutfy/recorded_videos", "/xcoutfy/storage_videos"]
+UPLOADED_DIR = "/xcoutfy/uploaded_videos"
+RCLONE_REMOTE = "xcoutfyvideos:xcvideos"
 
+UPLOAD_DELAY_SEC = 30  # mantém o buffer pra HDD/Drive
+LOCK_FILE = "/tmp/xcoutfy_upload.lock"
+PID_FILE = "/tmp/xcoutfy_upload.pid"
+LOG_FILE = "/xcoutfy/logs/02upload.log"
 
-def wait_until_ready(path, timeout=180, poll=5):
-    """Espera até o MP4 ficar pronto, ou estoura timeout (segundos)."""
-    start = time.time()
-    while time.time() - start < timeout:
-        if is_mp4_ready(path):
-            return True
-        time.sleep(poll)
-    return False
-# === PATCH END ===
-
+# Tolerâncias de janela FREE2UP
+GRACE_BEFORE_SEC = 90   # se faltar <= 90s pra janela abrir, espera e segue
+GRACE_AFTER_SEC  = 300  # se a janela abriu há <= 5min, ainda aceita
 
 # =========================
 # Logging
@@ -57,165 +50,303 @@ class Logger(object):
         self.terminal.flush()
         self.log.flush()
 
-
-sys.stdout = Logger("/xcoutfy/logs/02upload.log")
+sys.stdout = Logger(LOG_FILE)
 sys.stderr = sys.stdout
 
+# =========================
+# Utilitários
+# =========================
+@contextmanager
+def file_lock(lock_path):
+    """Evita execuções paralelas."""
+    if os.path.exists(lock_path):
+        print(f"⚠️ Lock ativo ({lock_path}), encerrando.")
+        return
+    try:
+        open(lock_path, "w").close()
+        yield
+    finally:
+        if os.path.exists(lock_path):
+            os.remove(lock_path)
 
-# =========================
-# Config
-# =========================
-CREDENTIALS_PATH = "/xcoutfy/credentials.json"
-SHEET_NAME = "dbgravacoes"
-SHEET_REGISTERS = "registros"
-VIDEO_DIRS = ["/xcoutfy/recorded_videos", "/xcoutfy/storage_videos"]
-UPLOADED_DIR = "/xcoutfy/uploaded_videos"
-RCLONE_REMOTE = "xcoutfyvideos:xcvideos"
-UPLOAD_DELAY_SEC = 30
-CHECK_INTERVAL = 30
+def is_already_running(pid_file):
+    """Verifica se já existe outro processo ativo."""
+    if os.path.exists(pid_file):
+        with open(pid_file, "r") as f:
+            pid = int(f.read().strip())
+        if psutil.pid_exists(pid):
+            print(f"⚠️ Processo já em execução (PID {pid}), abortando nova instância.")
+            return True
+    with open(pid_file, "w") as f:
+        f.write(str(os.getpid()))
+    return False
 
+def clear_pid(pid_file):
+    if os.path.exists(pid_file):
+        os.remove(pid_file)
 
-# =========================
-# Helpers
-# =========================
-def connect_to_sheets():
-    scopes = [
+def get_mp4_files():
+    """Coleta vídeos MP4 de diretórios configurados."""
+    all_files = []
+    for d in VIDEO_DIRS:
+        if not os.path.exists(d):
+            continue
+        for f in os.listdir(d):
+            if f.endswith(".mp4"):
+                all_files.append(os.path.join(d, f))
+    return all_files
+
+def file_hash(path):
+    """Hash MD5 para evitar uploads duplicados."""
+    h = hashlib.md5()
+    with open(path, "rb") as f:
+        while True:
+            chunk = f.read(8192)
+            if not chunk:
+                break
+            h.update(chunk)
+    return h.hexdigest()
+
+def connect_sheets():
+    """Autentica no Google Sheets com escopos completos (Sheets + Drive)."""
+    SCOPES = [
         "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
+        "https://www.googleapis.com/auth/drive"
     ]
-    creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=scopes)
+    creds = Credentials.from_service_account_file(CREDENTIALS_PATH, scopes=SCOPES)
     client = gspread.authorize(creds)
     return client
 
-
-# === PATCH START: função segura para abrir aba com backoff ===
-def safe_open_sheet(client, sheet_name, tab, retries=5):
-    """Abre planilha e aba com retry/backoff em caso de erro 429."""
-    for i in range(retries):
-        try:
-            sh = client.open(sheet_name).worksheet(tab)
-            return sh
-        except gspread.exceptions.APIError as e:
-            if "Quota exceeded" in str(e) and i < retries - 1:
-                wait = 2 * (i + 1)
-                print(f"⏳ Cota Sheets excedida, nova tentativa em {wait}s...")
-                time.sleep(wait)
-                continue
-            raise
-# === PATCH END ===
-
-
-def extract_metadata_from_filename(filename: str):
-    """Extrai customer, equipment, day e duration do nome do arquivo."""
+# ---------- Janela FREE2UP com tolerância ----------
+def _parse_today_dt(hour, minute):
+    now = datetime.now()
     try:
-        name = os.path.basename(filename).replace(".mp4", "")
-        parts = name.split("___")
-        if len(parts) < 3:
-            return "unknown_customer", "unknown_eqp", "unknown_day", "unknown_duration"
+        return now.replace(hour=int(hour), minute=int(minute), second=0, microsecond=0)
+    except Exception:
+        return None
 
-        meta_part = parts[2]
-        meta_parts = meta_part.split("_")
-
-        customer = meta_parts[0] if len(meta_parts) > 0 else "unknown_customer"
-        equipment = meta_parts[1] if len(meta_parts) > 1 else "unknown_eqp"
-        day = meta_parts[2] if len(meta_parts) > 2 else "unknown_day"
-        duration = meta_parts[3] if len(meta_parts) > 3 else "unknown_duration"
-
-        return customer, equipment, day, duration
-
-    except Exception as e:
-        print(f"⚠️ Erro ao extrair metadados: {e}")
-        return "unknown_customer", "unknown_eqp", "unknown_day", "unknown_duration"
-
-
-def append_row_safe(sheet, values):
-    """Tenta registrar linha na planilha com até 3 tentativas."""
-    for attempt in range(1, 4):
+def _find_upcoming_free2up(agenda):
+    """Retorna (start_dt, end_dt) da próxima janela FREE2UP para este host, se achada."""
+    host = os.uname()[1]
+    best = None
+    for item in (agenda or []):
         try:
-            sheet.append_row(values)
-            print(f"✅ Registro inserido na planilha (tentativa {attempt}).")
+            if str(item.get("type", "")).lower() != "free2up":
+                continue
+            # se houver filtro de equipamento/host, respeita
+            eqp = str(item.get("equipment", "") or item.get("equipamento", "") or "")
+            if eqp and eqp != host:
+                continue
+            hour = item.get("hour") or item.get("hora")
+            minute = item.get("minute") or item.get("minuto")
+            duration = item.get("duration") or item.get("duracao") or item.get("tempo") or 600
+            start = _parse_today_dt(hour, minute)
+            if not start:
+                continue
+            end = start + timedelta(seconds=int(duration))
+            if not best or start < best[0]:
+                best = (start, end)
+        except Exception:
+            continue
+    return best  # (start_dt, end_dt) ou None
+
+def ensure_free2up_window():
+    """
+    Garante que estamos numa janela FREE2UP, com tolerância:
+      - Se faltar <= GRACE_BEFORE_SEC para iniciar, espera até abrir.
+      - Se já abriu há <= GRACE_AFTER_SEC, segue mesmo assim.
+    Retorna True se pode seguir; False caso contrário.
+    """
+    try:
+        agenda, _ = get_agenda()
+        # tenta janela “oficial” do helper
+        window = get_current_window(agenda)
+    except Exception as e:
+        print(f"⚠️ Erro ao buscar agenda: {e}")
+        agenda, window = None, None
+
+    # Compatibilidade com tupla
+    if isinstance(window, tuple):
+        try:
+            window = window[0] if len(window) > 0 else {}
+        except Exception:
+            window = {}
+
+    now = datetime.now()
+
+    # 1) Se já veio uma janela ativa e for FREE2UP, segue
+    if isinstance(window, dict) and str(window.get("type", "")).lower() == "free2up":
+        print("✅ Janela FREE2UP ativa (via get_current_window).")
+        return True
+
+    # 2) Descobrir próxima janela do dia e aplicar tolerâncias
+    start_end = _find_upcoming_free2up(agenda or [])
+    if not start_end:
+        print("⏹️ Nenhuma janela FREE2UP encontrada para hoje. Encerrando.")
+        return False
+
+    start, end = start_end
+    if now < start:
+        delta = (start - now).total_seconds()
+        if delta <= GRACE_BEFORE_SEC:
+            print(f"⏳ Janela FREE2UP começa em {int(delta)}s. Aguardando abertura...")
+            time.sleep(max(1, int(delta)))
+            print("🟢 Janela aberta. Seguindo.")
             return True
-        except Exception as e:
-            print(f"⚠️ Falha ao registrar na planilha (tentativa {attempt}): {e}")
-            time.sleep(3)
-    print("🚨 Falhou ao registrar na planilha após 3 tentativas.")
-    return False
+        else:
+            print(f"⏹️ Janela FREE2UP ainda demora ({int(delta)}s). Encerrando.")
+            return False
+    elif now > end:
+        # passou, mas dá uma folga
+        delta_end = (now - end).total_seconds()
+        if delta_end <= GRACE_AFTER_SEC:
+            print(f"🟡 Janela FREE2UP acabou há {int(delta_end)}s, mas dentro da tolerância. Seguindo.")
+            return True
+        else:
+            print(f"⏹️ Janela FREE2UP encerrada há {int(delta_end)}s. Encerrando.")
+            return False
+    else:
+        # dentro do intervalo
+        print("✅ Dentro da janela FREE2UP.")
+        return True
 
+# ---------- Upload + Link ----------
+def upload_to_drive(filepath):
+    """Faz upload via rclone e retorna o link público."""
+    filename = os.path.basename(filepath)
+    remote_path = f"{RCLONE_REMOTE}/{filename}"
+    print(f"☁️ Enviando {filename} para {remote_path} ...")
 
-def upload_video(filepath, filename, register_sheet):
-    if not os.path.exists(filepath):
-        print(f"⚠️ Arquivo {filename} não encontrado. Pulando.")
-        return
-
-    # Extrai metadados
-    customer, equipment, day, duration = extract_metadata_from_filename(filename)
-    local = equipment
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-    destination_remote = f"{RCLONE_REMOTE}/{filename}"
-    print(f"🚀 Enviando {filename} ao Google Drive...")
-    upload_result = subprocess.run(["rclone", "copy", filepath, RCLONE_REMOTE, "-v"])
-
-    if upload_result.returncode != 0:
-        print(f"❌ Falha no upload de {filename}")
-        return
-
-    # Confirma presença no Drive
-    for _ in range(10):
-        check = subprocess.run(
-            ["rclone", "lsf", RCLONE_REMOTE],
-            capture_output=True,
-            text=True,
-        )
-        if filename in check.stdout:
-            break
-        time.sleep(1)
+    result = subprocess.run(
+        ["rclone", "copy", filepath, RCLONE_REMOTE, "--progress"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+    )
+    print(result.stdout)
 
     # Gera link público
     try:
-        link_result = subprocess.run(
-            ["rclone", "link", destination_remote],
-            capture_output=True,
+        link_proc = subprocess.run(
+            ["rclone", "link", f"{remote_path}"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
             text=True,
-            check=True,
         )
-        public_link = link_result.stdout.strip()
-        print(f"🔗 Link público: {public_link}")
-    except subprocess.CalledProcessError:
-        public_link = f"https://drive.google.com/drive/u/0/search?q={filename}"
-        print("⚠️ Falha ao gerar link público com rclone.")
+        link = link_proc.stdout.strip()
+    except Exception as e:
+        print(f"⚠️ Falha ao gerar link: {e}")
+        link = "N/A"
+    return link
 
-    # Registro na planilha
-    values = [
-        timestamp,
-        duration,
-        customer,
-        local,
-        equipment,
-        day,
-        filename,
-        public_link,
-        "",
-        "uploaded",
-        "",
-    ]
-    append_row_safe(register_sheet, values)
+# ---------- Registro por cabeçalho ----------
+def _parse_from_filename(filename):
+    """
+    Extrai cliente, equipamento, dia_semana, duracao do padrão:
+    YYYY_MM_DD___HH_MM___<cliente>_<equipamento>_<Dia>_<duracao>.mp4
+    """
+    base = os.path.basename(filename)
+    name = base[:-4] if base.lower().endswith(".mp4") else base
+    parts = name.split("___")
+    cliente = equipamento = dia_semana = duracao = ""
+    if len(parts) >= 3:
+        tail = parts[2]  # <cliente>_<equip>_<Dia>_<duracao>
+        segs = tail.split("_")
+        if len(segs) >= 4:
+            cliente = segs[0]
+            equipamento = segs[1]
+            dia_semana = segs[2]
+            duracao = segs[3]
+    return cliente, equipamento, dia_semana, duracao
 
-    # === PATCH START: garantir integridade antes de mover ===
-    print(f"⏳ Verificando integridade do vídeo antes de mover...")
-    if not wait_until_ready(filepath, timeout=180, poll=5):
-        print(f"⚠️ Arquivo {filename} não passou na verificação de integridade. Pulando move.")
-        return
-    # === PATCH END ===
 
-    # Move o arquivo local para uploaded_videos
-    os.makedirs(UPLOADED_DIR, exist_ok=True)
-    final_path = os.path.join(UPLOADED_DIR, filename + ".uploaded")
+
+
+
+
+def register_on_sheet(sheet_client, filename, drive_link):
+    """
+    Lê a primeira linha (cabeçalho) e preenche por nome de coluna.
+    Suporta diretamente os headers:
+      timestamp, duration, customer, local, equipment, day,
+      filename, drive_link, youtube_link, status, notes
+    Mantém compatibilidade com sinônimos usados em versões antigas.
+    """
     try:
-        shutil.move(filepath, final_path)
-        print(f"📁 Arquivo movido para {final_path}")
-    except FileNotFoundError:
-        print(f"⚠️ Arquivo {filename} já havia sido movido ou excluído.")
+        sheet = sheet_client.open(SHEET_NAME).worksheet(SHEET_REGISTERS)
+        header = sheet.row_values(1)
+        if not header:
+            # Fallback simples se não houver cabeçalho
+            sheet.append_row([datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                              filename, drive_link, os.uname()[1]])
+            print(f"📊 Registro adicionado (fallback) para {filename}")
+            return
+
+        # ====== dados vindos do arquivo ======
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        customer, equipment, day_name, duration = _parse_from_filename(filename)
+        host = os.uname()[1]
+        status = "uploaded"
+        youtube_link = ""   # ainda não temos aqui
+        notes = ""          # opcional
+
+        # ====== mapa por nomes de coluna ======
+        # Mapeia tanto os nomes "oficiais" quanto sinônimos comuns
+        candidates = {
+            # timestamp
+            "timestamp": now_str, "data_hora": now_str, "datahora": now_str, "data": now_str,
+
+            # duration
+            "duration": duration, "duracao": duration,
+
+            # customer
+            "customer": customer, "cliente": customer,
+
+            # local (deixa vazio por enquanto; pode preencher com site/campo se tiver)
+            "local": "",
+
+            # equipment
+            "equipment": equipment, "equipamento": equipment, "eqp": equipment,
+
+            # day
+            "day": day_name, "dia_semana": day_name, "weekday": day_name, "dia": day_name,
+
+            # filename
+            "filename": filename, "arquivo": filename, "file": filename,
+
+            # drive_link
+            "drive_link": drive_link, "link": drive_link, "url": drive_link,
+
+            # youtube_link
+            "youtube_link": youtube_link, "yt_link": youtube_link,
+
+            # status
+            "status": status,
+
+            # notes
+            "notes": notes, "observacoes": notes,
+
+            # host/pc
+            "host": host, "pc": host, "hostname": host,
+        }
+
+        # monta a linha respeitando a ordem real do cabeçalho
+        row = []
+        for col in header:
+            key = col.strip().lower()
+            row.append(candidates.get(key, ""))
+
+        sheet.append_row(row)
+        print(f"📊 Registro adicionado para {filename}")
+    except Exception as e:
+        print(f"⚠️ Falha ao registrar no Sheets: {e}")
+
+
+
+
+
+
+
 
 
 # =========================
@@ -223,56 +354,54 @@ def upload_video(filepath, filename, register_sheet):
 # =========================
 def main():
     print("🌀 Iniciando 02upload.py...")
-    os.makedirs(UPLOADED_DIR, exist_ok=True)
-
-    # Conecta ao Sheets
-    try:
-        sheets = connect_to_sheets()
-        register_sheet = safe_open_sheet(sheets, SHEET_NAME, SHEET_REGISTERS)
-        print(f"✅ Conectado à planilha '{SHEET_NAME}', aba '{SHEET_REGISTERS}'.")
-    except Exception as e:
-        print(f"❌ Falha ao conectar à planilha: {e}")
+    if is_already_running(PID_FILE):
         return
 
-    # Janela FREE2UP
-    agenda, _ = get_agenda()
-    free2up_info, end_window = get_current_window(agenda)
+    with file_lock(LOCK_FILE):
+        # Janela com tolerância (espera se estiver prestes a abrir)
+        if not ensure_free2up_window():
+            print("⏹️ Nenhuma janela FREE2UP ativa (ou fora da tolerância). Encerrando.")
+            clear_pid(PID_FILE)
+            return
 
-    if not free2up_info:
-        print("⏹️ Nenhuma janela FREE2UP ativa. Encerrando.")
-        return
+        print("✅ Janela FREE2UP confirmada. Iniciando uploads...")
 
-    while True:
-        if end_window and datetime.now() > end_window:
-            print("⏹️ Janela FREE2UP encerrada. Saindo do upload.")
-            break
+        time.sleep(UPLOAD_DELAY_SEC)
+        print(f"⏳ Aguardado {UPLOAD_DELAY_SEC}s antes de iniciar uploads...")
 
-        now = time.time()
-        uploads_pending = False
+        files = get_mp4_files()
+        if not files:
+            print("📭 Nenhum vídeo para enviar.")
+            clear_pid(PID_FILE)
+            return
 
-        for folder in VIDEO_DIRS:
-            if not os.path.exists(folder):
+        print(f"🎞️ {len(files)} vídeo(s) encontrado(s). Conectando ao Sheets...")
+        client = connect_sheets()
+
+        uploaded_hashes = set()
+        for f in files:
+            h = file_hash(f)
+            if h in uploaded_hashes:
+                print(f"⚠️ Arquivo duplicado detectado: {f}")
                 continue
-            files = [
-                f
-                for f in os.listdir(folder)
-                if f.endswith(".mp4")
-                and not os.path.exists(os.path.join(UPLOADED_DIR, f + ".uploaded"))
-                and now - os.path.getmtime(os.path.join(folder, f)) > UPLOAD_DELAY_SEC
-            ]
-            if files:
-                print(f"🎮 {len(files)} vídeo(s) encontrados em {folder}.")
-                uploads_pending = True
-            for name in files:
-                filepath = os.path.join(folder, name)
-                upload_video(filepath, name, register_sheet)
+            uploaded_hashes.add(h)
 
-        if not uploads_pending:
-            print("✅ Nenhum vídeo pendente. Encerrando.")
-            break
+            link = upload_to_drive(f)
+            register_on_sheet(client, os.path.basename(f), link)
 
-        time.sleep(CHECK_INTERVAL)
+            # Move o arquivo para uploaded_videos
+            os.makedirs(UPLOADED_DIR, exist_ok=True)
+            dest = os.path.join(
+                UPLOADED_DIR, os.path.basename(f).replace(".mp4", ".uploaded")
+            )
+            try:
+                shutil.move(f, dest)
+                print(f"📦 Movido para {dest}")
+            except Exception as e:
+                print(f"⚠️ Falha ao mover arquivo: {e}")
 
+        print("✅ Todos os uploads finalizados.")
+        clear_pid(PID_FILE)
 
 if __name__ == "__main__":
     main()
