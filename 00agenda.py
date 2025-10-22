@@ -1,4 +1,5 @@
-# === 00agenda.py ===
+#!/usr/bin/env python3
+# === 00agenda.py (XCPC16 - final robusto) ===
 import os
 import time
 import json
@@ -60,6 +61,31 @@ executed_slots = set()
 pending_tasks = []  # fila de tarefas pendentes
 
 # ===========================
+# Helpers de PID
+# ===========================
+def _pidfile_alive(pidfile: str) -> bool:
+    if not os.path.exists(pidfile):
+        return False
+    try:
+        with open(pidfile, 'r') as f:
+            pid = int(f.read().strip())
+        return psutil.pid_exists(pid)
+    except Exception:
+        return False
+
+def _sanitize_pidfile(pidfile: str):
+    # Se o arquivo existe mas o processo não, remove o pidfile.
+    if os.path.exists(pidfile) and not _pidfile_alive(pidfile):
+        try:
+            os.remove(pidfile)
+        except Exception:
+            pass
+
+def _sanitize_all_pidfiles():
+    for pf in (UPLOAD_PID_FILE, RECORD_PID_FILE, CONTINUOUS_PID_FILE, STREAM_PID_FILE, BROADCAST_PID_FILE):
+        _sanitize_pidfile(pf)
+
+# ===========================
 # Agenda handling
 # ===========================
 def load_agenda_from_local():
@@ -76,7 +102,6 @@ def load_agenda_from_local():
 
 agenda_mem = load_agenda_from_local()
 
-
 def fetch_latest_agenda():
     """Busca a planilha na nuvem e ignora cabeçalhos vazios, duplicados e linhas em branco."""
     global agenda_mem
@@ -87,33 +112,23 @@ def fetch_latest_agenda():
         client = gspread.authorize(creds)
         sheet = client.open(SHEET_NAME).worksheet(AGENDA_TAB)
 
-        # Lê todas as linhas cruas
         all_rows = sheet.get_all_values()
         if not all_rows:
             print("⚠️ Planilha vazia ou inacessível.")
             return
 
-        # Primeira linha = cabeçalho limpo
-        #headers = [h.strip() for h in all_rows[0] if h.strip()]
-        #data_rows = all_rows[1:]
-        # Garante que todos os cabeçalhos existam, mesmo que estejam vazios
         headers = [h.strip() if h.strip() else f"col_{i}" for i, h in enumerate(all_rows[0])]
         data_rows = all_rows[1:]
 
-
-
         records = []
         for row in data_rows:
-            # Preenche até o tamanho dos headers e ignora linhas completamente vazias
             if not any(cell.strip() for cell in row):
                 continue
             record = dict(zip(headers, row))
             records.append(record)
 
-        # Filtra apenas as linhas do equipamento atual
         filtered = [r for r in records if str(r.get("equipment", "")).strip().lower() == eqp_name]
 
-        # Salva cópia local
         os.makedirs(os.path.dirname(AGENDA_PATH), exist_ok=True)
         with open(AGENDA_PATH, "w") as f:
             json.dump(filtered, f, ensure_ascii=False, indent=2)
@@ -122,12 +137,6 @@ def fetch_latest_agenda():
         print(f"✅ Agenda atualizada da nuvem. {len(filtered)} tarefas carregadas para {eqp_name}.")
     except Exception as e:
         print(f"⚠️ Erro ao buscar agenda da nuvem: {e}")
-
-
-
-
-
-
 
 # ===========================
 # Process handling
@@ -178,13 +187,17 @@ def launch_process_and_store_pid(script_path, pidfile, env=None, args=None):
     print(f"🚀 {script_path} iniciado com PID {process.pid}")
 
 def launch_upload_or_broadcast():
+    # Higieniza pidfiles zumbis antes de decidir
+    _sanitize_pidfile(UPLOAD_PID_FILE)
+    _sanitize_pidfile(BROADCAST_PID_FILE)
+
     if os.listdir(RECORDED_DIR):
-        if not os.path.exists(UPLOAD_PID_FILE):
+        if not _pidfile_alive(UPLOAD_PID_FILE):
             launch_process_and_store_pid(UPLOAD_SCRIPT, UPLOAD_PID_FILE)
         return
     files = [f for f in os.listdir(UPLOADED_DIR) if f.endswith(".uploaded")]
     if files:
-        if not os.path.exists(BROADCAST_PID_FILE):
+        if not _pidfile_alive(BROADCAST_PID_FILE):
             launch_process_and_store_pid(BROADCAST_SCRIPT, BROADCAST_PID_FILE)
 
 # ===========================
@@ -270,18 +283,12 @@ def process_pending_tasks():
 # ===========================
 # Main loop
 # ===========================
-#if __name__ == "__main__":
-#    last_fetch = 0
-#    shown_upcoming = False
-#
-#    while True:
-#        if time.time() - last_fetch >= CHECK_INTERVAL:
-#            fetch_latest_agenda()
-#            last_fetch = time.time()
-#            shown_upcoming = False
-#
-
 if __name__ == "__main__":
+    # Reset de memória e limpeza de pid zumbi no boot do serviço
+    executed_slots.clear()
+    pending_tasks.clear()
+    _sanitize_all_pidfiles()
+
     last_fetch = 0
     shown_upcoming = False
     FORCE_REFRESH_INTERVAL = 600  # força atualização da nuvem a cada 10 minutos
@@ -289,7 +296,7 @@ if __name__ == "__main__":
     while True:
         now_time = time.time()
 
-        # Atualiza agenda periodicamente ou caso a anterior falhe
+        # Atualiza agenda periodicamente
         if now_time - last_fetch >= CHECK_INTERVAL:
             try:
                 fetch_latest_agenda()
@@ -299,14 +306,12 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"⚠️ Erro durante atualização da agenda: {e}")
 
-        # Força atualização completa da nuvem a cada 10 minutos, mesmo sem mudanças
+        # Força atualização completa da nuvem a cada 10 minutos
         if now_time - last_fetch >= FORCE_REFRESH_INTERVAL:
             print(f"🔁 Forçando atualização completa da nuvem às {datetime.now().strftime('%H:%M:%S')}")
             fetch_latest_agenda()
             last_fetch = now_time
             shown_upcoming = False
-
-
 
         if not shown_upcoming:
             eqp_name = socket.gethostname()
